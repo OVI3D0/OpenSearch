@@ -137,13 +137,19 @@ class FlightOutboundHandler extends ProtocolOutboundHandler {
             return;
         }
 
-        flightChannel.getExecutor().execute(() -> {
+        // Block the producer thread before queuing the batch so a slow consumer throttles
+        // allocation rather than letting the eventloop's queue grow. Note: isReady()
+        // reflects only gRPC's outbound buffer, not our own queue depth — see
+        // docs/backpressure.md "Known limitation: unbounded eventloop queue".
+        flightChannel.awaitReadyOrThrow();
+
+        flightChannel.getExecutor().execute(threadPool.getThreadContext().preserveContext(() -> {
             try (BatchTask ignored = task) {
                 processBatchTask(task);
             } catch (Exception e) {
                 messageListener.onResponseSent(requestId, action, e);
             }
-        });
+        }));
     }
 
     private void processBatchTask(BatchTask task) {
