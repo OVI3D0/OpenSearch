@@ -118,6 +118,15 @@ public interface BackendCapabilityProvider {
     }
 
     /**
+     * Per-function adapters for transforming backend-agnostic aggregate {@link org.apache.calcite.rel.core.AggregateCall}s
+     * into backend-compatible forms before fragment conversion. Keyed by {@link AggregateFunction}.
+     * Empty map means no adaptation needed (emit the original call as-is).
+     */
+    default Map<AggregateFunction, AggregateFunctionAdapter> aggregateFunctionAdapters() {
+        return Map.of();
+    }
+
+    /**
      * Per-function serializers for delegated predicates this backend can accept.
      * Keyed by {@link ScalarFunction} — the framework dispatches to the matching
      * serializer during fragment conversion when a predicate is delegated to this backend.

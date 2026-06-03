@@ -20,6 +20,7 @@ import org.opensearch.analytics.backend.EngineResultStream;
 import org.opensearch.analytics.spi.AbstractNameMappingAdapter;
 import org.opensearch.analytics.spi.AggregateCapability;
 import org.opensearch.analytics.spi.AggregateFunction;
+import org.opensearch.analytics.spi.AggregateFunctionAdapter;
 import org.opensearch.analytics.spi.AnalyticsSearchBackendPlugin;
 import org.opensearch.analytics.spi.BackendCapabilityProvider;
 import org.opensearch.analytics.spi.BackendExecutionContext;
@@ -416,6 +417,9 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
         AggregateFunction.COUNT,
         AggregateFunction.AVG,
         AggregateFunction.APPROX_COUNT_DISTINCT,
+        AggregateFunction.DISTINCT_COUNT_APPROX,
+        AggregateFunction.ARG_MIN,
+        AggregateFunction.ARG_MAX,
         AggregateFunction.PERCENTILE_APPROX,
         AggregateFunction.TAKE,
         AggregateFunction.FIRST,
@@ -496,6 +500,18 @@ public class DataFusionAnalyticsBackendPlugin implements AnalyticsSearchBackendP
                     WindowFunctionAdapters.argMax(),
                     WindowFunction.DISTINCT_COUNT_APPROX,
                     WindowFunctionAdapters.distinctCountApprox()
+                );
+            }
+
+            @Override
+            public Map<AggregateFunction, AggregateFunctionAdapter> aggregateFunctionAdapters() {
+                return Map.of(
+                    AggregateFunction.ARG_MIN,
+                    AggregateFunctionAdapters.argMin(),
+                    AggregateFunction.ARG_MAX,
+                    AggregateFunctionAdapters.argMax(),
+                    AggregateFunction.DISTINCT_COUNT_APPROX,
+                    AggregateFunctionAdapters.distinctCountApprox()
                 );
             }
 

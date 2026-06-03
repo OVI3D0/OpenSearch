@@ -11,6 +11,7 @@ package org.opensearch.analytics.planner.dag;
 import org.apache.calcite.plan.RelOptCluster;
 import org.apache.calcite.plan.RelOptUtil;
 import org.apache.calcite.rel.RelNode;
+import org.apache.calcite.rel.core.AggregateCall;
 import org.apache.calcite.rel.type.RelDataType;
 import org.apache.calcite.rel.type.RelDataTypeField;
 import org.apache.calcite.rex.RexBuilder;
@@ -36,6 +37,8 @@ import org.opensearch.analytics.spi.FieldStorageInfo;
 import org.opensearch.analytics.spi.ScalarFunction;
 import org.opensearch.analytics.spi.ScalarFunctionAdapter;
 import org.opensearch.analytics.spi.WindowFunction;
+import org.opensearch.analytics.spi.AggregateFunction;
+import org.opensearch.analytics.spi.AggregateFunctionAdapter;
 import org.opensearch.analytics.spi.WindowFunctionAdapter;
 
 import java.util.ArrayList;
@@ -73,7 +76,11 @@ public class BackendPlanAdapter {
         List<StagePlan> adapted = new ArrayList<>(stage.getPlanAlternatives().size());
         for (StagePlan plan : stage.getPlanAlternatives()) {
             var capabilityProvider = registry.getBackend(plan.backendId()).getCapabilityProvider();
-            Adapters adapters = new Adapters(capabilityProvider.scalarFunctionAdapters(), capabilityProvider.windowFunctionAdapters());
+            Adapters adapters = new Adapters(
+                capabilityProvider.scalarFunctionAdapters(),
+                capabilityProvider.windowFunctionAdapters(),
+                capabilityProvider.aggregateFunctionAdapters()
+            );
             LOGGER.debug("Before adaptation [{}]:\n{}", plan.backendId(), RelOptUtil.toString(plan.resolvedFragment()));
             RelNode fragment = adaptNode(plan.resolvedFragment(), adapters);
             LOGGER.debug("After adaptation [{}]:\n{}", plan.backendId(), RelOptUtil.toString(fragment));
@@ -87,7 +94,11 @@ public class BackendPlanAdapter {
     }
 
     /** Backend-provided adapter maps, bundled so helper signatures stay narrow. */
-    private record Adapters(Map<ScalarFunction, ScalarFunctionAdapter> scalar, Map<WindowFunction, WindowFunctionAdapter> window) {
+    private record Adapters(
+        Map<ScalarFunction, ScalarFunctionAdapter> scalar,
+        Map<WindowFunction, WindowFunctionAdapter> window,
+        Map<AggregateFunction, AggregateFunctionAdapter> agg
+    ) {
     }
 
     private static RelNode adaptNode(RelNode node, Adapters adapters) {
@@ -108,14 +119,74 @@ public class BackendPlanAdapter {
         if (node instanceof OpenSearchJoin join) {
             return adaptJoin(join, adapters, adaptedChildren, childrenChanged);
         }
-        if (node instanceof OpenSearchAggregate agg && agg.getMode() == AggregateMode.FINAL) {
-            OpenSearchAggregate withAdaptedChildren = childrenChanged
-                ? (OpenSearchAggregate) agg.copy(agg.getTraitSet(), adaptedChildren)
-                : agg;
-            return DistributedAggregateRewriter.rewrite(withAdaptedChildren);
+        if (node instanceof OpenSearchAggregate agg) {
+            OpenSearchAggregate withAdaptedAggCalls = adaptAggregate(agg, adapters, adaptedChildren, childrenChanged);
+            if (agg.getMode() == AggregateMode.FINAL) {
+                return DistributedAggregateRewriter.rewrite(withAdaptedAggCalls);
+            }
+            return withAdaptedAggCalls;
         }
 
         return childrenChanged ? node.copy(node.getTraitSet(), adaptedChildren) : node;
+    }
+
+    /**
+     * Applies per-{@link AggregateFunction} adapters to each {@link AggregateCall} in the
+     * aggregate. Backends that need to rewrite a logical aggregate (e.g. {@code ARG_MIN(value, ts)}
+     * → {@code first_value(value) ORDER BY ts}) register an adapter and the call is replaced
+     * before fragment conversion. Adapters fire on both PARTIAL and FINAL aggregates.
+     */
+    private static OpenSearchAggregate adaptAggregate(
+        OpenSearchAggregate agg,
+        Adapters adapters,
+        List<RelNode> adaptedChildren,
+        boolean childrenChanged
+    ) {
+        List<AggregateCall> originalCalls = agg.getAggCallList();
+        List<AggregateCall> adaptedCalls = null;
+        if (!adapters.agg().isEmpty()) {
+            for (int i = 0; i < originalCalls.size(); i++) {
+                AggregateCall call = originalCalls.get(i);
+                AggregateFunction fn = resolveAggregateFunction(call.getAggregation());
+                AggregateFunctionAdapter adapter = fn == null ? null : adapters.agg().get(fn);
+                if (adapter == null) continue;
+                List<RelDataType> argTypes = new ArrayList<>(call.getArgList().size());
+                RelDataType inputRowType = (childrenChanged ? adaptedChildren.getFirst() : agg.getInput()).getRowType();
+                for (Integer idx : call.getArgList()) {
+                    argTypes.add(inputRowType.getFieldList().get(idx).getType());
+                }
+                AggregateCall adapted = adapter.adapt(call, argTypes, agg.getCluster());
+                if (adapted != call) {
+                    if (adaptedCalls == null) adaptedCalls = new ArrayList<>(originalCalls);
+                    adaptedCalls.set(i, adapted);
+                }
+            }
+        }
+        if (adaptedCalls == null && !childrenChanged) {
+            return agg;
+        }
+        return new OpenSearchAggregate(
+            agg.getCluster(),
+            agg.getTraitSet(),
+            childrenChanged ? adaptedChildren.getFirst() : agg.getInput(),
+            agg.getGroupSet(),
+            agg.getGroupSets(),
+            adaptedCalls != null ? adaptedCalls : originalCalls,
+            agg.getMode(),
+            agg.getViableBackends(),
+            agg.getCallAnnotations(),
+            agg.getFinalExtraLiteralArgs(),
+            agg.getIntermediateFields()
+        );
+    }
+
+    /** Resolves an aggregate operator to {@link AggregateFunction}; null if not in the SPI enum. */
+    private static AggregateFunction resolveAggregateFunction(org.apache.calcite.sql.SqlAggFunction op) {
+        try {
+            return AggregateFunction.fromSqlAggFunction(op);
+        } catch (IllegalStateException ignored) {
+            return null;
+        }
     }
 
     /**

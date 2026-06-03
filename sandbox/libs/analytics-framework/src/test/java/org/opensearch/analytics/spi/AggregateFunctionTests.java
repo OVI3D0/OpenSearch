@@ -18,8 +18,11 @@ import org.opensearch.test.OpenSearchTestCase;
 import java.util.List;
 
 import static org.opensearch.analytics.spi.AggregateFunction.APPROX_COUNT_DISTINCT;
+import static org.opensearch.analytics.spi.AggregateFunction.ARG_MAX;
+import static org.opensearch.analytics.spi.AggregateFunction.ARG_MIN;
 import static org.opensearch.analytics.spi.AggregateFunction.AVG;
 import static org.opensearch.analytics.spi.AggregateFunction.COUNT;
+import static org.opensearch.analytics.spi.AggregateFunction.DISTINCT_COUNT_APPROX;
 import static org.opensearch.analytics.spi.AggregateFunction.FIRST;
 import static org.opensearch.analytics.spi.AggregateFunction.LAST;
 import static org.opensearch.analytics.spi.AggregateFunction.LIST;
@@ -136,6 +139,29 @@ public class AggregateFunctionTests extends OpenSearchTestCase {
         assertEquals(integer, resolve(fields.get(0), integer));
     }
 
+    // ── ARG_MIN / ARG_MAX: engine-native, the SqlAggFunction PPL emits for `earliest` / `latest` in `stats … by`. ──
+
+    public void testArgMinReducerIsSelf() {
+        List<AggregateFunction.IntermediateField> fields = ARG_MIN.intermediateFields();
+        assertEquals(1, fields.size());
+        assertEquals("arg_min_state", fields.get(0).name());
+        assertSame(ARG_MIN, fields.get(0).reducer());
+        assertEquals(integer, resolve(fields.get(0), integer));
+    }
+
+    public void testArgMaxReducerIsSelf() {
+        List<AggregateFunction.IntermediateField> fields = ARG_MAX.intermediateFields();
+        assertEquals(1, fields.size());
+        assertEquals("arg_max_state", fields.get(0).name());
+        assertSame(ARG_MAX, fields.get(0).reducer());
+        assertEquals(integer, resolve(fields.get(0), integer));
+    }
+
+    public void testArgMinMaxResolveBySqlKind() {
+        assertSame(ARG_MIN, AggregateFunction.fromSqlKind(SqlKind.ARG_MIN));
+        assertSame(ARG_MAX, AggregateFunction.fromSqlKind(SqlKind.ARG_MAX));
+    }
+
     // ── LIST: engine-native (single field, reducer == self, parameterised resolver) ──
 
     public void testListHasDecomposition() {
@@ -180,6 +206,13 @@ public class AggregateFunctionTests extends OpenSearchTestCase {
     public void testPercentileApproxResolvesByName() {
         assertSame(AggregateFunction.PERCENTILE_APPROX, AggregateFunction.fromNameOrError("percentile_approx"));
         assertSame(AggregateFunction.PERCENTILE_APPROX, AggregateFunction.fromNameOrError("PERCENTILE_APPROX"));
+    }
+
+    public void testDistinctCountApproxResolvesByName() {
+        // PPL surfaces this as `distinct_count_approx(field)`; mirrored as a separate enum
+        // entry so the SPI lookup path matches what the planner emits without extra rewrites.
+        assertSame(DISTINCT_COUNT_APPROX, AggregateFunction.fromNameOrError("distinct_count_approx"));
+        assertSame(DISTINCT_COUNT_APPROX, AggregateFunction.fromNameOrError("DISTINCT_COUNT_APPROX"));
     }
 
     // ── fromSqlKind still works ──
