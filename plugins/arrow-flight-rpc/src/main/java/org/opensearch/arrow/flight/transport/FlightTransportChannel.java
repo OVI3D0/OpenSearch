@@ -8,6 +8,7 @@
 
 package org.opensearch.arrow.flight.transport;
 
+import org.apache.arrow.memory.BufferAllocator;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.opensearch.Version;
@@ -84,6 +85,11 @@ class FlightTransportChannel extends TcpTransportChannel {
 
     @Override
     public void sendResponseBatch(TransportResponse response) {
+        sendResponseBatch(response, false);
+    }
+
+    @Override
+    public void sendResponseBatch(TransportResponse response, boolean sync) {
         if (!streamOpen.get()) {
             throw new StreamException(StreamErrorCode.UNAVAILABLE, "Stream is closed for requestId [" + requestId + "]");
         }
@@ -100,7 +106,8 @@ class FlightTransportChannel extends TcpTransportChannel {
                 action,
                 response,
                 compressResponse,
-                isHandshake
+                isHandshake,
+                sync
             );
         } catch (StreamException e) {
             // Cancelled: consumer is gone, release ends the call cleanly. For other
@@ -148,5 +155,16 @@ class FlightTransportChannel extends TcpTransportChannel {
 
     public void releaseChannel(boolean isExceptionResponse) {
         release(isExceptionResponse);
+    }
+
+    // Not an @Override on 3.5: the ArrowFlightChannel interface that declares getAllocator()
+    // is part of the un-backported arrow-flight lineage. Kept as a plain accessor.
+    public BufferAllocator getAllocator() {
+        return ((FlightServerChannel) getChannel()).getAllocator();
+    }
+
+    @Override
+    public boolean isCancelled() {
+        return getChannel() instanceof FlightServerChannel fsc && fsc.isCancelled();
     }
 }

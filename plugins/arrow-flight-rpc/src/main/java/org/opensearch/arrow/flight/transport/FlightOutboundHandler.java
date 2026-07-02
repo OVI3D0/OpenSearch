@@ -32,11 +32,14 @@ import org.opensearch.transport.TransportMessageListener;
 import org.opensearch.transport.TransportRequest;
 import org.opensearch.transport.TransportRequestOptions;
 import org.opensearch.transport.nativeprotocol.NativeOutboundMessage;
+import org.opensearch.transport.stream.StreamErrorCode;
 import org.opensearch.transport.stream.StreamException;
 
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.Future;
 
 /**
  * Outbound handler for Arrow Flight streaming responses.
@@ -113,7 +116,8 @@ class FlightOutboundHandler extends ProtocolOutboundHandler {
         final String action,
         final TransportResponse response,
         final boolean compress,
-        final boolean isHandshake
+        final boolean isHandshake,
+        final boolean sync
     ) throws IOException {
         ThreadContext.StoredContext storedContext = threadPool.getThreadContext().stashContext();
         BatchTask task = new BatchTask(
@@ -143,13 +147,49 @@ class FlightOutboundHandler extends ProtocolOutboundHandler {
         // docs/backpressure.md "Known limitation: unbounded eventloop queue".
         flightChannel.awaitReadyOrThrow();
 
-        flightChannel.getExecutor().execute(threadPool.getThreadContext().preserveContext(() -> {
+        // NOTE: 3.5 lacks #22244's releaseUnsent/handedOff buffer-ownership model, so we keep #22359's
+        // sync/async send path but omit the releaseUnsent cleanup wrapper (the BatchTask try-with-resources
+        // frees under 3.5's older buffer lifecycle instead).
+        final Runnable sendBatch = threadPool.getThreadContext().preserveContext(() -> {
             try (BatchTask ignored = task) {
                 processBatchTask(task);
             } catch (Exception e) {
                 messageListener.onResponseSent(requestId, action, e);
             }
-        }));
+        });
+        // sync blocks the caller until the batch has been pushed to gRPC's outbound buffer before
+        // returning; async returns once it is queued. Both run on the channel's single-threaded executor.
+        if (sync) {
+            Future<?> future = flightChannel.getExecutor().submit(sendBatch);
+            awaitSend(future);
+        } else {
+            flightChannel.getExecutor().execute(sendBatch);
+        }
+    }
+
+    /**
+     * Blocks the caller until the executor has run the submitted send, so the caller cannot submit the
+     * next batch until this one has been pushed to gRPC's outbound buffer (a full buffer is throttled by
+     * the readiness back-pressure gate). The send itself runs on the channel's flight executor (so it is
+     * serialized with the stream-root free that {@code close()} posts to the same executor); this only
+     * parks the caller for the result. The caller must be a producer thread, not the flight executor
+     * thread itself (blocking on the result from that thread would deadlock the single-threaded executor).
+     */
+    private void awaitSend(Future<?> future) {
+        try {
+            future.get();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new StreamException(StreamErrorCode.INTERNAL, "Interrupted while sending batch synchronously", e);
+        } catch (ExecutionException e) {
+            // The work body catches its own exceptions and routes them to the listener, so this is not
+            // expected; surface it rather than swallow if it ever happens.
+            Throwable cause = e.getCause() != null ? e.getCause() : e;
+            if (cause instanceof StreamException se) {
+                throw se;
+            }
+            throw new StreamException(StreamErrorCode.INTERNAL, "Error sending batch synchronously", cause);
+        }
     }
 
     private void processBatchTask(BatchTask task) {
